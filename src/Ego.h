@@ -25,7 +25,6 @@ using std::cout;
 using std::cerr;
 using std::endl;
 
-//TODO create internal Planner class
 class Ego : virtual public Car {
 public:
     constexpr static double MAX_ACCEL = 10.00;              // m/s**2
@@ -40,8 +39,6 @@ public:
     // PATH_HORIZON_TICKS should always be less than PREDICTION_NEAR_HORIZON_TICKS and, preferably, < (SPLINE_POINT_1/SPEED_LIMIT_MPS)/DT
     constexpr static double PATH_HORIZON_SEC = 0.5;
     constexpr static int PATH_HORIZON_TICKS = int(PATH_HORIZON_SEC / DT);
-
-    //TODO rem    constexpr static int ARC_TICKS = 10;  // ARC_TICKS should be smaller than PATH_HORIZON_TICKS
 
     // Distance at which the  other cars become visible to radar.
     constexpr static double OTHER_CAR_DETECTION_HORIZON = 60;
@@ -138,20 +135,7 @@ public:
     bool isInLaneChangeState();
     bool isInPrepLaneChangeState();
 
-/* TODO rem
-    void setPrevT(std::chrono::high_resolution_clock::time_point pt) {
-        this->prevT = pt;
-    }
-*/
-
 private:
-    // Note: this->targetVel is the desired current speed (target speed).  Telemetry vel. is due to the previous points that the car tries to follow.
-    // TODO rem double targetVel;
-
-/* TODO rem
-    double dt = -1;
-    std::chrono::high_resolution_clock::time_point prevT;*/
-
     // Previous path data
     vector<double> previous_path_x;
     vector<double> previous_path_y;
@@ -230,9 +214,6 @@ private:
     double lane_off_center_cost(const Trajectory &trajectory);
 
     double lane_weaving_cost(const Trajectory &trajectory);
-
-    //TODO rem
-    //double out_of_lane_and_accel_spline_cost(const Trajectory &trajectory);
 
     enum COST_TYPES {
         COLLISION_COST, INEFFICIENCY_COST, PREPARE_LANE_CHANGE_COST, OFF_LANE_CENTER_COST, LANE_WEAVING_COST

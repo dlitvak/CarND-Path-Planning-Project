@@ -15,10 +15,6 @@ using std::cout;
 using std::endl;
 
 int main() {
-    //TODO rem
-    std::ofstream out("./out.txt");
-    std::cout.rdbuf(out.rdbuf()); //redirect std::cout to out.txt!
-
     uWS::Hub h;
 
     // Waypoint map to read from
@@ -48,12 +44,6 @@ int main() {
                 if (event == "telemetry") {
                     json msgJson;
 
-                    //TODO rem
-                    std::cout.flush();
-
-                    /*TODO: define a path made up of (x,y) points that the car will visit
-                     *   sequentially every .02 seconds
-                     */
                     ego.setTelemetry(j);
                     vector<Car::Position> path = ego.get_best_path();
 
