@@ -31,6 +31,7 @@
 #include <cassert>
 #include <vector>
 #include <algorithm>
+#include <iostream>
 
 
 // unnamed namespace only because the implementation is in this

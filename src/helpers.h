@@ -4,6 +4,7 @@
 #include <math.h>
 #include <string>
 #include <vector>
+#include "Road.h"
 
 // for convenience
 using std::string;
@@ -167,4 +168,17 @@ static double convert_ms_to_mph(double ms) {
     return ms * 3600./1609.;
 }
 
+// Calculate circular distance between cars.
+// Account for the cars on the different sides of MAX_S.  After MAX_S, the simulator returns 0.
+// if car1 is ahead of car2, return distance > 0, otherwise < 0
+static double frenetCircSDistanceBetweenCars(const double car1_s, const double car2_s) {
+    double circ_dist1 = car1_s - car2_s;
+    double circ_dist2 = Road::MAX_S - abs(circ_dist1);
+    return abs(circ_dist1) < circ_dist2 ? circ_dist1 : (circ_dist1 < 0 ? circ_dist2 : -1*circ_dist2);
+}
+
+static double addFrenetCircSDistance(const double car_s, const double ds) {
+    double sum_dist = car_s + ds;
+    return sum_dist > Road::MAX_S ? sum_dist - Road::MAX_S : sum_dist;
+}
 #endif  // HELPERS_H

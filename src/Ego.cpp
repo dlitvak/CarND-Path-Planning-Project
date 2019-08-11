@@ -6,37 +6,44 @@
 #include "Ego.h"
 
 using std::cout;
+using std::cerr;
 using std::endl;
 
 Ego::Ego(Road *rd) : Car() {
     this->road = rd;
     this->lane = Road::MIDDLE_LANE;
-
-    this->targetVel = MAX_ACCEL * DT;
 }
 
 void Ego::setTelemetry(
     nlohmann::basic_json<map, vector, string, bool, int64_t, uint64_t, double, std::allocator, nlohmann::adl_serializer> &j) {
+
+    if (!this->timerStarted) {
+        startTime = std::chrono::system_clock::now();
+        this->timerStarted = true;
+    }
+
+/* TODO rem
+    const std::chrono::duration<double, std::milli> &time_span = std::chrono::high_resolution_clock::now() - this->prevT;
+    this->dt = this->dt < 0 ? DT : time_span.count() / 1000.;
+*/
 
     // j[1] is the data JSON object
     // Note: this->targetVel is the desired current speed (target speed).  Telemetry vel. is due to the previous points that the car tries to follow.
 
     this->x = j[1]["x"];
     this->y = j[1]["y"];
-    
-    if (this->prev_vel != 0)
-        this->prev_accel = getEstimatedAccel();
-    
-    this->prev_vel = this->vel;
     this->vel = convert_mph_to_ms(j[1]["speed"]);
     this->s = j[1]["s"];
     this->d = j[1]["d"];
     this->yaw = j[1]["yaw"];
 
+    this->vx = this->vel * cos(this->yaw);
+    this->vy = this->vel * sin(this->yaw);
+
     auto curr_lane = (Road::LANE)(d/Road::LANE_WIDTH);
-    if (curr_lane != this->lane) {  //changed lane
+    if (curr_lane != this->lane && this->isInLaneChangeState()) {  //changed lane
         this->lane = curr_lane;
-        this->laneChangeFinished = true;
+        this->laneCrossedInLCState = true;
     }
 
     // Previous path data given to the Planner
@@ -54,7 +61,10 @@ void Ego::setTelemetry(
     this->end_path_s = j[1]["end_path_s"];
     this->end_path_d = j[1]["end_path_d"];
 
-    this->other_cars.clear();
+    this->controller = {this->previous_path_x, this->previous_path_y, this->controller.getTargetVel()};
+
+    this->other_cars_id_map.clear();
+    this->other_cars_lane_map.clear();
 
     // Sensor Fusion Data, a list of all other cars on the same side
     //   of the road.
@@ -77,30 +87,50 @@ void Ego::setTelemetry(
         double fs = fren[0];
         double fd = fren[1];
 
-        Car car = Car(id, x, y, vx, vy, fs, fd, this->road);
+        double dist_bw_cars = abs(frenetCircSDistanceBetweenCars(this->s, fs));
+        if (dist_bw_cars < Ego::OTHER_CAR_DETECTION_HORIZON && (fd >= 0 && fd <= Road::NUM_LANES * Road::LANE_WIDTH)) {
+            Car car = Car(id, x, y, vx, vy, fs, fd, this->road);
 
-        //cout << "sensor_fusion: id: " << id << ", fus_s: " << fs << ", fus_d: " << fd << ", der_s: " << fren[0] << ", der_d: " << fren[1] << endl;
+            //TODO rem cout << "Lane: " << car.getLane() << ", id: " << car.getId() << ", s: " << car.getS() << ", ego.s: " << this->s << endl;
 
-        double dist_bw_cars = abs(Ego::frenetCircSDistanceBetweenCars(this->s, car.getS()));
-        if (dist_bw_cars < Ego::OTHER_CAR_DETECTION_HORIZON) {
-            //cout << "Lane: " << car.getLane() << ", id: " << car.getId() << ", s: " << car.getS() << ", ego.s: " << this->s << endl;
+            this->other_cars_id_map.insert(std::pair<int, Car>(id, &car));
 
-            this->other_cars.insert(std::pair<int, Car>(id, &car));
+            auto it = this->other_cars_lane_map.find(car.getLane());
+            if (it == this->other_cars_lane_map.end()) {
+                this->other_cars_lane_map.insert(std::pair<Road::LANE, vector<Car>>(car.getLane(), vector<Car>()));
+                it = this->other_cars_lane_map.find(car.getLane());
+            }
+            it->second.push_back(car);
         }
     }
+
+    // sort this->other_cars_lane_map according to the car frenet S coord in each lane
+    for (short l = 0; l < Road::NUM_LANES; ++l) {
+        auto it = this->other_cars_lane_map.find((Road::LANE)l);
+        if (it != this->other_cars_lane_map.end()) { //if there are cars in the lane sort them by circ frenet distance
+            std::sort(it->second.begin(), it->second.end());
+
+            // TODO rem
+            cout << "-------- Lane " << it->first << " --------" << endl;
+            for (auto &vec_it : it->second) {
+                cout << vec_it.getId() << ", s: " << vec_it.getS() << endl;
+            }
+        }
+    }
+
+    this->set_cars_ahead_and_behind();
+    this->calculate_lane_speeds();
 }
 
-double Ego::getEstimatedAccel() const { return (vel - prev_vel) / DT; }
-
-Ego::Path Ego::get_best_path() {
+vector<Car::Position> Ego::get_best_path() {
     // Log lap number
-    if (this->s > 0.0 && this->s < 1.0 && !this->roadLapUpdated) {
+    if (this->s > 0.0 && this->s < 10.0 && !this->roadLapUpdated) {
         this->roadLap++;
         this->roadLapUpdated = true;
         cout << "Road Lap " << this->roadLap << endl;
     }
 
-    if (this->s > 1.0)
+    if (this->s > 10.0)
         this->roadLapUpdated = false;
 
     //log debug info
@@ -109,174 +139,124 @@ Ego::Path Ego::get_best_path() {
     int min = (int)(el_sec/60) % 60;
     int hrs = (int)(el_sec/3600);
     int sec = el_sec % 60;
-    cout << "--------------- Miles: " << convert_meters_to_miles(this->s + (this->roadLap-1)*Road::MAX_S) << ", Time: " << (hrs > 0 ? std::to_string(hrs) + ":" : "") << min << ":" << sec << " ---------------" << endl;
+    cout << "--------------- Miles: " << convert_meters_to_miles(this->s + (this->roadLap-1)*Road::MAX_S) <<
+    ", Time: " << (hrs > 0 ? std::to_string(hrs) + ":" : "") << min << ":" << sec << " --------------- (e.st: " <<
+    (int)this->fsm_state << ", e.ln: " << this->lane << ", e.s: " << this->s << ", e.d: " << this->d << ", e.tV: " << this->controller.getTargetVel() << ", e.sfV: " << this->vel << ")" << endl;
 
     this->recordIncident();
-
-    this->set_cars_ahead_and_behind();
-    this->calculate_lane_speeds();
-
-    map<int, vector<Car>> predictions;
-    for (auto & other_car : this->other_cars) {
-        predictions[other_car.first] = generate_prediction(other_car.second);
-    }
 
     vector<FSM_STATES > possible_successor_states = get_possible_successor_states();
     double min_traj_cost = INT_MAX;
     Ego::Trajectory bestTraj;
-    Ego::Path bestPath;
+    vector<Car::Position> bestPath;
+
     cout << "********************************" << endl;
+
     for (FSM_STATES st : possible_successor_states) {
         const vector<Ego::Trajectory> & possible_traj_for_state = generate_trajectory(st);
-        for (auto & traj : possible_traj_for_state) {
-            Ego::Path retPath;
-            double trajCost = calculate_traj_path_cost(traj, predictions, retPath);
+        for (auto traj : possible_traj_for_state) {
+            double trajCost = calculate_traj_path_cost(traj);
 
             cout << "state: " << (int)st << ", cost: " << trajCost << endl;
 
             if (trajCost < min_traj_cost) {
                 min_traj_cost = trajCost;
-                bestPath = retPath;
+                bestPath = traj.path;
                 bestTraj = traj;
             }
         }
     }
-    cout << "@@@@@@@@@@@@@@@@@@@@@" << endl;
+    cout << "********************************" << endl;
 
-    if (bestTraj.s >= 0) {    // s will be > 0 99.9% of times on non-dummy trajectories
-        this->fsm_state = bestTraj.state;
-        this->targetVel = bestTraj.v;
+    // make sure that bestTraj has been set
+    assert(bestTraj.target_spline1_s >= 0);
 
-        if (this->fsm_state != Ego::FSM_STATES::LCL && this->fsm_state != Ego::FSM_STATES::LCR) {
-            this->laneChangeFinished = false;
+    bool is_potential_colln = false;
+    if (bestTraj.potential_collision_car_id >= 0 && bestTraj.target_state == Ego::FSM_STATES::KL) {
+        // A rare case of an imminent collision in the best cost trajectory.  FSM weights push Ego to go into KL state.
+        Car &colln_car = this->other_cars_id_map[bestTraj.potential_collision_car_id];
+        if (abs(colln_car.getD() - this->d) < 0.85 * Road::LANE_WIDTH) {   // 0.85 * 4m leaves about 1m between the cars sideways (car width 2.5m)
+            // Collision is imminent in ALL possible successor FSM states.  PLC & LC should have higher collision cost
+            // weights than KL. Thus, KL will be a favored state.
+            // Simplistic emergency strategy: stay in KL and increase or decrease target speed depending on the adjacent car locations.
+
+            is_potential_colln = true;
+            bool dealt_with_colln = true;
+            double s_colln_dist = frenetCircSDistanceBetweenCars(colln_car.getS(), this->s);
+            if (s_colln_dist < 0) {   // Ego is ahead of colln causing car.  Try to speed up.
+                Car &car_ahd = this->cars_ahead[this->lane];
+                if (car_ahd.getId() < 0 || frenetCircSDistanceBetweenCars(car_ahd.getS(), this->s) > Ego::MIN_VEHICLE_FOLLOWING_DISTANCE) {
+                    // Ego is ahead of the coll-n vehicle AND there's no car ahead or the car ahead is far enough: try to accelerate.
+                    bool accelSucc = this->controller.accelerate_max(TargetV_Controller::ACCEL_DIR::PLUS);
+
+                    //TODO rem
+                    if (accelSucc) cout << "Dealing with the imminent colln with car id " << colln_car.getId() << ". New targ vel after accel: " << this->controller.getTargetVel() << endl;
+
+                    if (!accelSucc) {
+                        Ego::TargetV_Controller::emergency("Car id " + std::to_string(colln_car.getId()) +
+                                                           " is causing an imminent collision. Ego can't accelerate; it's already at max acceleration.");
+                        // In the real world, I would try to change lane.  Here, I stay in KL state and with the same path & vel and print a warning message.
+                        dealt_with_colln = false;
+                    }
+                } else {
+                    Ego::TargetV_Controller::emergency("Car id " + std::to_string(colln_car.getId()) +
+                                                       " is causing an imminent collision. Ego can't accelerate; there's a car (id: " +
+                                                       std::to_string(car_ahd.getId()) + ") ahead.");
+                    // In the real world, I would try to change lane.  Here, I stay in KL state and with the same path & vel and print a warning message.
+                    dealt_with_colln = false;
+                }
+            }
+            else {
+                // coll-n car is ahead of Ego. Slow down till a stop, if have to.
+                bool accelSucc = this->controller.accelerate_max(TargetV_Controller::ACCEL_DIR::MINUS);
+
+                //TODO rem
+                if (accelSucc) cout << "Dealing with the imminent colln with car id " << colln_car.getId() << ". New targ vel after decel: " << this->controller.getTargetVel() << endl;
+
+                if (!accelSucc) {
+                    Ego::TargetV_Controller::emergency("Car id " + std::to_string(colln_car.getId()) +
+                                                       " is causing an imminent collision. Ego can't decelerate; it's already stopped.");
+                    // In the real world, I would try to change lane.  Here, I stay in KL state and with the same path & vel and print a warning message.
+                    dealt_with_colln = false;
+                }
+            }
+
+            this->fsm_state = Ego::FSM_STATES::KL;
+            if (dealt_with_colln) {
+                // non-emergency: KL and accel or decel.
+                bestPath = getPath(this->previous_path_x, this->previous_path_y, bestTraj.target_spline1_s, bestTraj.target_d, this->controller.getTargetVel(), Ego::PATH_HORIZON_SEC);
+            }
+            else {
+                // emergency: keep the best vel & path (simple strategy)
+                this->controller.setTargetVel(bestTraj.target_v);
+            }
         }
     }
-    cout << "STATE: " << (int)this->fsm_state << endl;
 
-    assert(!bestPath.pts_x.empty() && bestPath.pts_x.size() == bestPath.pts_y.size());
+    if (!is_potential_colln) { // no imminent coll-n
+        bool is_previous_state_LC = this->isInLaneChangeState();
+        this->fsm_state = bestTraj.target_state;
+        this->controller.setTargetVel(bestTraj.target_v);
 
-    //TODO this  might be wrong to limit path like this
-    vector<double> ptsx(bestPath.pts_x.begin(), bestPath.pts_x.begin() + Ego::PATH_HORIZON);
-    vector<double> ptsy(bestPath.pts_y.begin(), bestPath.pts_y.begin() + Ego::PATH_HORIZON);
+        if (!this->isInLaneChangeState() ) {
+            // reset the flag here: to indicate the lane change was finished.
+            // Used later in gen_lane_change_trajectories to figure out the initial target lane at the start of LC
+            this->laneCrossedInLCState = false;
 
-    return Ego::Path {ptsx, ptsy};
-}
-
-// get the path for a possible kinematics/trajectory
-Ego::Path Ego::getPath(const Ego::Trajectory & traj) {
-    vector<double> ptsx;
-    vector<double> ptsy;
-
-    int prev_size = previous_path_x.size();
-    double ref_x = this->x;
-    double ref_y = this->y;
-    double ref_s = this->s;
-    double ref_yaw = this->yaw;
-    double prev_ref_x;
-    double prev_ref_y;
-
-    if (prev_size < 2) {
-        prev_ref_x = ref_x - cos(ref_yaw);
-        prev_ref_y = ref_y - sin(ref_yaw);
-    } else {
-        prev_ref_x = this->previous_path_x[prev_size - 2];
-        prev_ref_y = previous_path_y[prev_size - 2];
-
-        ref_x = previous_path_x[prev_size - 1];
-        ref_y = previous_path_y[prev_size - 1];
-        ref_yaw = atan2(ref_y - prev_ref_y, ref_x - prev_ref_x);
+            if (is_previous_state_LC && this->fsm_state == Ego::FSM_STATES::KL) {
+                // start KL timer.  The timer is used to deal with excessive lane weaving:
+                // stay in KL state for some seconds unless a collision is imminent.
+                this->KL_state_start_timepoint = std::chrono::high_resolution_clock::now();
+            }
+        }
     }
 
-    //std::cout << "prev_sz: " << prev_size << std::endl;
-    ptsx.push_back(prev_ref_x);
-    ptsx.push_back(ref_x);
+    cout << "BEST STATE: " << (int)this->fsm_state << endl;
+    assert(!bestPath.empty());
 
-    ptsy.push_back(prev_ref_y);
-    ptsy.push_back(ref_y);
-
-    Road::Map map = this->road->getMap();
-    vector<double> next_wp0 = getXY(ref_s + SPLINE_POINT_1, traj.d, map.map_waypoints_s, map.map_waypoints_x,
-                                    map.map_waypoints_y);
-    vector<double> next_wp1 = getXY(ref_s + SPLINE_POINT_2, traj.d, map.map_waypoints_s, map.map_waypoints_x,
-                                    map.map_waypoints_y);
-    vector<double> next_wp2 = getXY(ref_s + SPLINE_POINT_3, traj.d, map.map_waypoints_s, map.map_waypoints_x,
-                                    map.map_waypoints_y);
-
-    ptsx.push_back(next_wp0[0]);
-    ptsx.push_back(next_wp1[0]);
-    ptsx.push_back(next_wp2[0]);
-
-    ptsy.push_back(next_wp0[1]);
-    ptsy.push_back(next_wp1[1]);
-    ptsy.push_back(next_wp2[1]);
-
-    // transform into car's coord system
-    for (int p = 0; p < ptsx.size(); ++p) {
-        double shift_x = ptsx[p] - ref_x;
-        double shift_y = ptsy[p] - ref_y;
-
-        //cout << "x,y: " << ptsx[p] << "," << ptsy[p] << "; shift: " << shift_x << "," << shift_y << "; yaw, cos, sin: " << ref_yaw << "," << cos(ref_yaw)<< "," << sin(ref_yaw) << ", s: " << car_s << endl;
-
-        ptsx[p] = shift_x * cos(ref_yaw) + shift_y * sin(ref_yaw);
-        ptsy[p] = shift_y * cos(ref_yaw) - shift_x * sin(ref_yaw);
-    }
-
-    // add points to the vector returned to the sim
-    Path path;
-
-    // add previous path points to the next set, so that the total path is continuous
-    for (int p = 0; p < prev_size; ++p) {
-        double px = previous_path_x[p];
-        double py = previous_path_y[p];
-        path.pts_x.push_back(px);
-        path.pts_y.push_back(py);
-
-        vector<double> fren = getFrenet(px, py, ref_yaw, map.map_waypoints_x, map.map_waypoints_y);
-        path.pts_s.push_back(fren[0]);
-        path.pts_d.push_back(fren[1]);
-    }
-
-    tk::spline spl;
-    spl.set_points(ptsx, ptsy);
-
-    double target_x = SPLINE_POINT_1;
-    double target_y = spl(target_x);
-    double target_dist = sqrt(target_x * target_x + target_y * target_y);
-
-    double vel = (traj.v >= 0 ? traj.v : this->targetVel);   
-    if (vel<= 0)
-        vel = 0.001;  //prevent division by zero and illegal going bkwd
-    double inc = target_x / (target_dist / (vel * DT));
-
-    //cout << "traj_vel: " << (traj.v >= 0 ? std::to_string(traj.v) : "none") << ", tar_vel_after: " << this->targetVel << endl;
-
-    for (int p = 1; p <= PREDICTION_HORIZON - prev_size; ++p) {
-        double x_pnt = inc * p;
-        double y_pnt = spl(x_pnt);
-
-        // transform from car's coord system into global map
-        double rot_x = x_pnt * cos(ref_yaw) - y_pnt * sin(ref_yaw);
-        double rot_y = y_pnt * cos(ref_yaw) + x_pnt * sin(ref_yaw);
-
-        double px = rot_x + ref_x;
-        double py = rot_y + ref_y;
-        path.pts_x.push_back(px);
-        path.pts_y.push_back(py);
-
-        vector<double> fren = getFrenet(px, py, ref_yaw, map.map_waypoints_x, map.map_waypoints_y);
-        path.pts_s.push_back(fren[0]);
-        path.pts_d.push_back(fren[1]);
-    }
-
-    /*cout << ">>>>>>>>>>>> Prediction EGO <<<<<<<<<<<<<<" << endl;
-    for (int p = 0; p < PREDICTION_HORIZON; ++p) {
-        cout << "id: EGO, pred.x: " << path.pts_x[p] << ", pred.y: " << path.pts_y[p] << ", pred.s: "
-            << path.pts_s[p] << ", pred.d: " << path.pts_d[p] << endl;
-    }
-    cout << ">>>>>>>>>>>> Prediction_end <<<<<<<<<<<<<<" << endl;
-*/
-
-    return path;
+    const vector<Position> &retPath = (bestPath.size() <= Ego::PATH_HORIZON_TICKS ? bestPath :
+        vector<Car::Position>(bestPath.begin(), bestPath.begin() + Ego::PATH_HORIZON_TICKS));
+    return retPath;
 }
 
 /*
@@ -291,7 +271,7 @@ vector<Ego::FSM_STATES> Ego::get_possible_successor_states() {
             if (this->lane == Road::LEFT_LANE || this->lane == Road::MIDDLE_LANE)
                 possible_states.push_back(FSM_STATES::PLCR);
             if (this->lane == Road::RIGHT_LANE || this->lane == Road::MIDDLE_LANE)
-               possible_states.push_back(FSM_STATES::PLCL);
+                possible_states.push_back(FSM_STATES::PLCL);
             break;
 
         case FSM_STATES::PLCL:
@@ -330,79 +310,203 @@ vector<Ego::Trajectory> Ego::generate_trajectory(FSM_STATES next_state) {
     if (next_state == FSM_STATES::KL) {
         trajectories = gen_keep_lane_trajectory();
     }
-    else if (next_state == FSM_STATES::LCL || next_state == FSM_STATES::LCR) {
+    else if (Ego::isInLaneChangeState(next_state)) {
         trajectories = gen_lane_change_trajectories(next_state);
     }
-    else if (next_state == FSM_STATES::PLCL || next_state == FSM_STATES::PLCR) {
+    else if (Ego::isInPrepLaneChangeState(next_state)) {
         trajectories = gen_prep_lane_change_trajectory(next_state);
     }
 
     return trajectories;
 }
 
-// Generates predictions for non-ego vehicles to be used in trajectory
-//   generation for the ego vehicle.
-vector<Car> Ego::generate_prediction(Car &c) {
-    vector<Car> prediction;
-    double t = DT;
-    //cout << ">>>>>>>>>>>> Prediction <<<<<<<<<<<<<<" << endl;
-    for (int p=0; p < PREDICTION_HORIZON; ++p) {
-        prediction.push_back(c.position_at(t));
-        t += DT;
-    }
-    //cout << ">>>>>>>>>>>> Prediction_end <<<<<<<<<<<<<<" << endl;
-    return prediction;
-}
-
 //TODO
 vector<Ego::Trajectory> Ego::gen_keep_lane_trajectory() {
-    vector<Ego::Trajectory> trajectory;
+    double new_v = get_kinematics(this->lane);
+    double sp1 = Car::SPLINE_POINT_1;
+    double min_acc_tot = MAXFLOAT;
+    Trajectory best_traj;
+    for (int i = 0; sp1 + i < Car::SPLINE_POINT_2; i += 4) {
+        Trajectory traj = Trajectory(FSM_STATES::KL, this->lane, sp1 + i,
+                                     Road::LANE_WIDTH * this->lane + Road::LANE_WIDTH / 2., new_v);
+        traj.path = getPath(this->previous_path_x, this->previous_path_y, traj.target_spline1_s, traj.target_d, traj.target_v, (double)Car::PREDICTION_FAR_HORIZON_SEC);
+        double accel = get_max_tot_accel(traj);
+        if (accel < min_acc_tot) {
+            min_acc_tot = accel;
+            best_traj = traj;
+        }
+    }
 
-    vector<double> kinematics = get_kinematics(this->lane);
-    double new_s = kinematics[0];
-    double new_v = kinematics[1];
-    double new_a = kinematics[2];
-    Ego::Trajectory end_pnt(FSM_STATES::KL, this->lane, Ego::PATH_HORIZON, Road::LANE_WIDTH*this->lane + Road::LANE_WIDTH/2., new_v);
-    trajectory.push_back(end_pnt);
-
-    return trajectory;
+    return {best_traj};
 }
 
 //TODO
 vector<Ego::Trajectory> Ego::gen_lane_change_trajectories(Ego::FSM_STATES state) {
-    Road::LANE change_lane = this->lane;
-    if (!this->laneChangeFinished) {
+    Road::LANE target_change_lane = this->lane;
+    if (!this->laneCrossedInLCState) {
         if (state == Ego::FSM_STATES::LCL) {
-            change_lane = (Road::LANE) (this->lane - 1);
+            target_change_lane = (Road::LANE) (this->lane - 1);
         } else if (state == Ego::FSM_STATES::LCR) {
-            change_lane = (Road::LANE) (this->lane + 1);
+            target_change_lane = (Road::LANE) (this->lane + 1);
         } else
             throw std::runtime_error(
                 "ERROR: gen_lane_change_trajectories state is wrong: " + std::to_string((int) state) + ". Exiting..");
     }
 
-/*    for (auto& c : this->cars_ahead) {
-        cout << "Ahd: cid: " << c.getId() << ", c.s:" << c.getS() << ", ego.s: " << this->s << endl;
-    }
-    for (auto& c : this->cars_behind) {
-        cout << "Behd: cid: " << c.getId() << ", c.s:" << c.getS() << ", ego.s: " << this->s << endl;
-    }*/
+    vector<Ego::Trajectory> lc_traj;
+    double sp1 = Car::SPLINE_POINT_1;
+    Car::Position pos_infinity = Car::Position();
+    pos_infinity.pt_s = pos_infinity.pt_d = -1;
+    double target_d = Road::LANE_WIDTH * target_change_lane + Road::LANE_WIDTH / 2.;
 
-    //TODO account for veh behind
-    vector<double> kinematics = get_kinematics(change_lane);
-    double new_s = kinematics[0];
-    double new_ego_speed = kinematics[1];
-    double new_a = kinematics[2];
+/*
+    // Create trajectories arriving into the new lane at various coords s (dist_to_mid_change_lane) and times (time_lc)
+    for (int i = 0; sp1 + i < Car::SPLINE_POINT_2; i += 4) {
+        double sp1_s_dist = sp1 + i;
+        double d_dist = abs(this->d - target_d);
+        double change_lane_target_dist = sqrt(sp1_s_dist * sp1_s_dist + d_dist * d_dist);
+        double min_time = change_lane_target_dist / Road::SPEED_LIMIT_MPS;
+        double t_inc = 0.5;
 
-    vector<Ego::Trajectory> lct;
-    for (int i = 0; i < SPLINE_POINT_2; i+= 8) {
-        lct.emplace_back(state, change_lane, Ego::PATH_HORIZON + i, Road::LANE_WIDTH * change_lane + Road::LANE_WIDTH / 2., new_ego_speed);
+        for (int k = 0; min_time + k*t_inc < Ego::MAX_TOTAL_LANE_CHANGE_TIME_SEC; ++k) {
+            double time_lc = min_time + k*t_inc;
+            double ego_change_lane_vel = change_lane_target_dist / time_lc; // linear approximation of the velocity along the arc.
+
+            // TODO rem:  ego_change_lane_vel needs to account the increasing acceleration.
+            cout << "LC traj targ_sp1_s: " << sp1_s_dist << ", targ_d: " << target_d << ", time_lc: " << time_lc << ", ego_change_lane_vel: " << ego_change_lane_vel << endl;
+            assert(int(ego_change_lane_vel*1000)/1000. <= Road::SPEED_LIMIT_MPS);
+
+
+            // It's important to filter out bad trajectories in advance, as the cost function for proximity and
+            // collision only looks at PREDICTION_NEAR_HORIZON_TICKS ahead, which is less than SPLINE_POINT_1 distance.
+            vector<Car::Position> target_lane_gap_boundaries;
+            if (target_change_lane != this->lane) {
+                // Ego is still in the starting lane.
+
+                // Ego can not decrease its speed to that below the car behind in the starting lane if that car is too close.
+                Car &car_beh = this->cars_behind[this->lane];
+                if (car_beh.getId() >= 0) {
+                    double dist_beh = frenetCircSDistanceBetweenCars(this->s, car_beh.getS());
+                    
+                    //TODO rem
+                    assert(dist_beh > 0);
+                    
+                    if (dist_beh <= Ego::MIN_VEHICLE_FOLLOWING_DISTANCE && ego_change_lane_vel < car_beh.getVel()) {
+
+                        //TODO rem
+                        cout << "Car id " << car_beh.getId() << " has higher than ego velocity and is too close behind.  Skipping this trajectory.";
+
+                        continue;
+                    }
+                    
+                }
+                
+                // Figure out the gaps in the target lane.
+                target_lane_gap_boundaries.push_back(pos_infinity);  // gap before the 1st car in the target lane
+                auto itr = this->other_cars_lane_map.find(target_change_lane);
+                for (Car &c : itr->second) {
+                    target_lane_gap_boundaries.push_back(c.position_at(time_lc));
+                }
+                target_lane_gap_boundaries.push_back(pos_infinity);  // gap after the last car in the target lane
+            }
+            else {
+                // Ego is already in the target lane.  There's only 1 gap between the car behind and the car ahead.
+                // Let's see if Ego will fit into the gap in the future.
+                Car &car_beh = this->cars_behind[this->lane];
+                Car &car_ahd = this->cars_ahead[this->lane];
+                Car::Position gap_pos_beh = car_beh.getId() < 0 ? pos_infinity : car_beh.position_at(time_lc);
+                Car::Position gap_pos_ahd = car_ahd.getId() < 0 ? pos_infinity : car_ahd.position_at(time_lc);
+
+                target_lane_gap_boundaries.push_back(gap_pos_beh);
+                target_lane_gap_boundaries.push_back(gap_pos_ahd);
+            }
+
+            // Throw out the trajectories that land Ego in a gap too close to another vehicle.  
+            // Unlike collision cost, this code looks at the further horizon.
+            // Note: I set ego prediction at max Car::PREDICTION_FAR_HORIZON_SEC all the time, because time_lc is approximate
+            // due to the linear velocity approximation: ego_change_lane_vel
+            vector<Car::Position> ego_pred = getPath(this->previous_path_x, this->previous_path_y, sp1_s_dist,
+                                                     target_d, ego_change_lane_vel, Car::PREDICTION_FAR_HORIZON_SEC);
+            for (u_long p = 0; p < target_lane_gap_boundaries.size(); ++p) {
+                //todo GAP: aim at the 1 gap before and 1 ahead
+            }
+
+            lc_traj.emplace_back(state, target_change_lane, sp1_s_dist,
+                                 target_d, ego_change_lane_vel);
+        }
     }
-    return lct;
+
+    if (lc_traj.empty()) {
+        // Ensure at least on trajectory for lane change.  Try to match the target lane speed.
+        Car &car_ahd_targ_lane = this->cars_ahead[target_change_lane];
+        Car &car_beh_targ_lane = this->cars_behind[target_change_lane];
+        double change_lane_speed = this->controller.getTargetVel();
+
+        if (car_ahd_targ_lane.getId() >= 0) {
+            // if there's a car ahead, we should try to match its speed in the lane we are changing to
+            change_lane_speed = get_kinematics(target_change_lane);
+        }
+        else if (car_beh_targ_lane.getId() >= 0) {
+            // there's no car ahead, only a car behind
+            // Note: if there're NO cars ahead or behind OR the car behind has lower velocity than ego,
+            // we can switch lane with the current target vel.
+            if (car_beh_targ_lane.getVel() > this->controller.getTargetVel())
+                change_lane_speed = this->controller.getMaxNewVelocity(TargetV_Controller::ACCEL_DIR::PLUS);
+        }
+
+        //TODO rem
+        cout << ">> LC traj generation came short generating trajectories. Returning the default trajectory." << endl;
+
+        lc_traj.emplace_back(state, target_change_lane, sp1, target_d, change_lane_speed);
+
+    }
+    else {
+        // TODO rem
+        cout << ">> Exploring " << lc_traj.size() << " LC trajectories." << endl;
+        for (auto &traj : lc_traj) {
+            cout << "> Traj. sp1: " << traj.target_spline1_s << ", targ_vel: " << traj.target_v << ", targ_lane: " << traj.target_lane << ", ego.lane: " << this->lane << endl;
+        }
+    }
+*/
+
+    Car &car_ahd_targ_lane = this->cars_ahead[target_change_lane];
+    Car &car_beh_targ_lane = this->cars_behind[target_change_lane];
+    double change_lane_speed = this->controller.getTargetVel();
+
+    if (car_ahd_targ_lane.getId() >= 0) {
+        // if there's a car ahead, we should try to match its speed in the lane we are changing to
+        change_lane_speed = get_kinematics(target_change_lane);
+    }
+    else if (car_beh_targ_lane.getId() >= 0) {
+        // there's no car ahead, only a car behind
+        // Note: if there're NO cars ahead or behind OR the car behind has lower velocity than ego,
+        // we can switch lane with the current target vel.
+        if (car_beh_targ_lane.getVel() > this->controller.getTargetVel())
+            change_lane_speed = this->controller.getMaxNewVelocity(TargetV_Controller::ACCEL_DIR::PLUS);
+    }
+
+    Trajectory bestTraj;
+    double min_acc = MAXFLOAT;
+    for (int i = 0; sp1 + i < Car::SPLINE_POINT_2; i += 4) {
+        Trajectory traj = Trajectory(state, target_change_lane, sp1+i, target_d, change_lane_speed);
+        traj.path = getPath(this->previous_path_x, this->previous_path_y, traj.target_spline1_s, traj.target_d, traj.target_v, (double)Car::PREDICTION_FAR_HORIZON_SEC);
+        if (Ego::get_out_of_lane_time(traj) < Ego::MAX_TIME_OUT_OF_LANE) {
+            double accel = get_max_tot_accel(traj);
+            if (accel < Ego::MAX_ACCEL && accel < min_acc) {
+                min_acc = accel;
+                bestTraj = traj;
+            }
+        }
+    }
+
+    if (!bestTraj.path.empty())
+        lc_traj.push_back(bestTraj);
+
+    return  lc_traj;
 }
 
-
-//TODO
+// Generate a trajectory to prepare for a lane change.  Mainly, it is to try to match the velocity of the change lane.
+//  It also serves as a buffer between KL and LC states.
 vector<Ego::Trajectory> Ego::gen_prep_lane_change_trajectory(Ego::FSM_STATES state) {
     Road::LANE prep_for_lane;
     if (state == Ego::FSM_STATES::PLCL) {
@@ -416,42 +520,19 @@ vector<Ego::Trajectory> Ego::gen_prep_lane_change_trajectory(Ego::FSM_STATES sta
 
     vector<Ego::Trajectory> prepTraj;
 
-    // don't change the lane if the velocity is not significantly higher than that in the current lane.
-//    double cur_lane_speed = this->lane_speeds[this->lane];
-//    if (prep_lane_speed < cur_lane_speed + Ego::LANE_CHANGE_TRIGGER_VELOCITY_MS)
-//        return prepTraj;
-
-    //TODO collision cost calc could take care of that
-    // Abort prep for lane change if getting too close to the vehicle?
-/*
-    Car &car_ah = this->cars_ahead[this->lane];
-    if (car_ah.getId() >= 0) {
-        double dist_ah = abs(Ego::frenetSDistanceBetweenCars(car_ah.getS(), this->s));
-        if (dist_ah < Ego::MIN_VEHICLE_FOLLOWING_DISTANCE) {
-            cout << "Ah: Abort prep state: " << (int) state << " with dist_ah: " << dist_ah << endl;
-            return prepTraj;
-        }
-    }
-
-    Car &car_beh = this->cars_behind[this->lane];
-    if (car_beh.getId() >= 0) {
-        double dist_beh = abs(Ego::frenetCircSDistanceBetweenCars(car_ah.getS(), this->s));
-        if (dist_beh < Ego::MIN_VEHICLE_FOLLOWING_DISTANCE) {
-            cout << "Beh: Abort prep state: " << (int) state << " with dist_beh: " << dist_beh << endl;
-            return prepTraj;
-        }
-    }
-*/
-    double prep_lane_speed = this->targetVel;
-    Car &car_ah = this->cars_ahead[prep_for_lane];
+    double prep_lane_speed = this->controller.getTargetVel();
+    Car &car_ahd = this->cars_ahead[prep_for_lane];
     Car &car_beh = this->cars_behind[prep_for_lane];
 
-    if (car_ah.getId() >= 0 || car_beh.getId() >= 0) {
-        //TODO account for veh behind?
-        vector<double> kinematics = get_kinematics(prep_for_lane);
-        double new_s = kinematics[0];
-        prep_lane_speed = kinematics[1];
-        double new_a = kinematics[2];
+    if (car_ahd.getId() >= 0) {
+        // if there's a car ahead, we should try to match its speed in the lane we are preparing to change to
+        prep_lane_speed = get_kinematics(prep_for_lane);
+    }
+    else if (car_beh.getId() >= 0) {
+        // there's no car ahead, only a car behind
+        // Note: if there's NO cars ahead or behind, we can switch lane with the current target vel.
+        if (car_beh.getVel() > this->controller.getTargetVel())
+            prep_lane_speed = this->controller.getMaxNewVelocity(TargetV_Controller::ACCEL_DIR::PLUS);
     }
 
     // TODO
@@ -460,7 +541,10 @@ vector<Ego::Trajectory> Ego::gen_prep_lane_change_trajectory(Ego::FSM_STATES sta
     cout << ">>>>>>>>> Ego new speed: " << prep_ego_speed << ", v_ah: " << this->cars_ahead[prep_for_lane].getVel() << " (id: " << this->cars_ahead[prep_for_lane].getId()
     << "), v_beh: " << cars_behind[prep_for_lane].getVel() << " (id: " << cars_behind[prep_for_lane].getId() << ")" << endl;
 */
-    prepTraj.emplace_back(state, prep_for_lane, (double) Ego::PATH_HORIZON, Road::LANE_WIDTH*this->lane + Road::LANE_WIDTH/2., prep_lane_speed);
+
+    Trajectory traj = Trajectory(state, prep_for_lane, (double) Car::SPLINE_POINT_1, Road::LANE_WIDTH * this->lane + Road::LANE_WIDTH / 2., prep_lane_speed);
+    traj.path = getPath(this->previous_path_x, this->previous_path_y, traj.target_spline1_s, traj.target_d, traj.target_v, (double)Car::PREDICTION_FAR_HORIZON_SEC);
+    prepTraj.push_back(traj);
     return prepTraj;
 }
 
@@ -468,89 +552,53 @@ vector<Ego::Trajectory> Ego::gen_prep_lane_change_trajectory(Ego::FSM_STATES sta
 // Gets next timestep kinematics (position, velocity, acceleration)
 //   for a given lane. Tries to choose the maximum velocity and acceleration,
 //   given other vehicle positions and accel/velocity constraints.
-vector<double> Ego::get_kinematics(Road::LANE ln) {
+double Ego::get_kinematics(Road::LANE ln) {
     assert(ln == Road::LANE::RIGHT_LANE || ln == Road::LANE::MIDDLE_LANE || ln == Road::LANE::LEFT_LANE );
 
-    double new_position;
     double new_velocity;
-    double new_accel;
-    double max_vel_change = Ego::MAX_ACCEL * DT;
-    double max_new_velocity = this->targetVel + max_vel_change;
     Car& vehicle_ahead = this->cars_ahead[ln];
 
-/*    for (auto& c : this->cars_ahead) {
-        cout << "Ahd2: cid: " << c.getId() << ", c.s:" << c.getS() << ", ego.s: " << this->s << ", c.addr: " << &c << ", v.addr: " << &vehicle_ahead << ", ln: " << ln << endl;
-        if (&c == &vehicle_ahead)
-            cout << "right address";
-    }
-    for (auto& c : this->cars_behind) {
-        cout << "Behd2: cid: " << c.getId() << ", c.s:" << c.getS() << ", ego.s: " << this->s << ", c.addr: " << &c << endl;
-        if (&c == &vehicle_ahead)
-            cout << "wrong address";
-    }*/
-
     if (vehicle_ahead.getId() >= 0) {  // if there's a car ahead
-        double car_dist = Ego::frenetCircSDistanceBetweenCars(vehicle_ahead.getS(), this->s);
+        double car_dist = frenetCircSDistanceBetweenCars(vehicle_ahead.getS(), this->s);
         assert(car_dist >= 0);
 
         double buffer_dist = car_dist - Ego::PREFERRED_VEHICLE_FOLLOWING_DISTANCE;
 
-        cout << "vel_ahead: " << vehicle_ahead.getVel() << ", ego.tag_vel: " << this->targetVel << ", ego.spd: " << this->vel << ", dist_ah: " << car_dist << ", buff_dist: " << buffer_dist << endl;
+        cout << "vel_ahead: " << vehicle_ahead.getVel() << ", ego.tag_vel: " << this->controller.getTargetVel() << ", ego.spd: " << this->vel << ", dist_ah: " << car_dist << ", buff_dist: " << buffer_dist << endl;
         cout << "ln: " << ln << ", ego.ln: " << this->lane << endl;
 
-        double vel_diff = this->targetVel - vehicle_ahead.getVel();
+        double vel_diff = this->controller.getTargetVel() - vehicle_ahead.getVel();
         if (buffer_dist > 0) {
             if (vel_diff > 0) {
                 double estim_decel = vel_diff*vel_diff / buffer_dist;
-                double decel = std::min(estim_decel, (double) Ego::MAX_ACCEL);
-                new_velocity = this->targetVel - decel * DT;
 
-                cout << "EC_buf_gt_0: " << new_velocity << ", ego targ vel: " << this->targetVel << ", est_decel: " << estim_decel << ", decel: " << decel << endl;
+                new_velocity = this->controller.getNewVelocity(-estim_decel);
+                cout << "EC_buf_gt_0: " << new_velocity << ", ego targ vel: " << this->controller.getTargetVel() << ", est_decel: " << -estim_decel << ", decel: " << -std::min(estim_decel, this->controller.getAbsMaxAccelT()) << endl;
             }
             else {
-                new_velocity = max_new_velocity;
+                new_velocity = this->controller.getMaxNewVelocity(TargetV_Controller::ACCEL_DIR::PLUS);;
 
-                cout << "CE_buf_gt_0: " << new_velocity << ", " << this->targetVel << endl;
+                cout << "CE_buf_gt_0: " << new_velocity << ", " << this->controller.getTargetVel() << endl;
             }
         }
         else {
             if (vel_diff > 0) {
-                new_velocity = this->targetVel - max_vel_change;
-                cout << "EC_buf_less_0: " << new_velocity << ", " << this->targetVel << endl;
+                new_velocity = this->controller.getMaxNewVelocity(TargetV_Controller::ACCEL_DIR::MINUS);
+                cout << "EC_buf_less_0: " << new_velocity << ", " << this->controller.getTargetVel() << endl;
             }
             else {
-                new_velocity = abs(vel_diff) > max_vel_change ? this->targetVel : vehicle_ahead.getVel() - max_vel_change;
-                cout << "CE_buf_less_0: new_vel: " << new_velocity << ", targ.vel: " << this->targetVel << ", ego.spd: " << this->vel << endl;
+                new_velocity = abs(vel_diff) > this->controller.getAbsMaxAccelT()*DT ? this->controller.getTargetVel() : this->controller.getMaxNewVelocity(TargetV_Controller::ACCEL_DIR::MINUS);
+                cout << "CE_buf_less_0: new_vel: " << new_velocity << ", targ.vel: " << this->controller.getTargetVel() << ", ego.spd: " << this->vel << endl;
             }
         }
     } else {
-        new_velocity = std::min(max_new_velocity, (double)Road::SPEED_LIMIT_MPS);
+        new_velocity = this->controller.getMaxNewVelocity(TargetV_Controller::ACCEL_DIR::PLUS);
     }
 
-    if (new_velocity < 0) {
-        cout << "#########################################################" << endl;
-        cout << "negative vel: " << new_velocity << " is illegal." << endl;
-        cout << "#########################################################" << endl;
-        new_velocity = 0;
-    }
+    assert(new_velocity >= 0);
+    assert(this->vel <= 50);
 
-    double vel_change = new_velocity - this->targetVel;
-    new_accel = vel_change / DT; // Equation: (v_1 - v_0)/t = acceleration
-    new_position = this->s + new_velocity*DT + new_accel*DT*DT / 2.0;
-
-    if (this->vel > 50) {
-        cout << "#########################################################" << endl;
-        cout << "Speed exceeds 50 mph limit. Vel: " << this->vel << endl;
-        cout << "#########################################################" << endl;
-    }
-
-    if (abs(new_accel) - Ego::MAX_ACCEL > 0.0001) {
-        cout << "#########################################################" << endl;
-        cout << "new accel: " << new_accel << " exceeds limit." << " newvel: " << new_velocity << " targVel: " << this->targetVel << ", egoVel: " << this->vel << ", diff: " << (new_accel - MAX_ACCEL) << ", vel_change: " << vel_change << endl;
-        cout << "#########################################################" << endl;
-    }
-
-    return {new_position, new_velocity, new_accel};
+    return new_velocity;
 }
 
 // Returns a true if a vehicle is found behind the current vehicle, false
@@ -560,10 +608,10 @@ bool Ego::get_vehicle_behind(Road::LANE ln, Car &rVehicle) {
     bool found_vehicle = false;
     Car temp_vehicle;
     rVehicle = temp_vehicle;
-    for (auto & oc : this->other_cars) {
+    for (auto & oc : this->other_cars_id_map) {
         temp_vehicle = oc.second;
-        if (temp_vehicle.getLane() == ln && Ego::frenetCircSDistanceBetweenCars(temp_vehicle.getS(), this->s) < 0
-            && Ego::frenetCircSDistanceBetweenCars(temp_vehicle.getS(), max_s) > 0) {
+        if (temp_vehicle.getLane() == ln && frenetCircSDistanceBetweenCars(temp_vehicle.getS(), this->s) < 0
+            && frenetCircSDistanceBetweenCars(temp_vehicle.getS(), max_s) > 0) {
             max_s = temp_vehicle.getS();
             rVehicle = temp_vehicle;
             found_vehicle = true;
@@ -580,10 +628,10 @@ bool Ego::get_vehicle_ahead(Road::LANE ln, Car &rVehicle) {
     bool found_vehicle = false;
     Car temp_vehicle;
     rVehicle = temp_vehicle;
-    for (auto & traj : this->other_cars) {
+    for (auto & traj : this->other_cars_id_map) {
         temp_vehicle = traj.second;
-        if (temp_vehicle.getLane() == ln && Ego::frenetCircSDistanceBetweenCars(temp_vehicle.getS(), this->s) >= 0
-            && (min_s < 0 || Ego::frenetCircSDistanceBetweenCars(temp_vehicle.getS(), min_s) < 0)) {
+        if (temp_vehicle.getLane() == ln && frenetCircSDistanceBetweenCars(temp_vehicle.getS(), this->s) >= 0
+            && (min_s < 0 || frenetCircSDistanceBetweenCars(temp_vehicle.getS(), min_s) < 0)) {
             min_s = temp_vehicle.getS();
             rVehicle = temp_vehicle;
             found_vehicle = true;
@@ -621,12 +669,10 @@ void Ego::calculate_lane_speeds() {
             if (this->lane == i)
                 this->lane_speeds[i] = Road::SPEED_LIMIT_MPS;
             else
-                this->lane_speeds[i] = (this->targetVel > v_behind &&
-                                        abs(Ego::frenetCircSDistanceBetweenCars(this->s, this->cars_behind[i].getS())) > 3 * Ego::IN_LANE_COLLISION_DISTANCE
-                                    ? Road::SPEED_LIMIT_MPS: v_behind);
+                this->lane_speeds[i] = (this->vel >= v_behind - Ego::LANE_CHANGE_TRIGGER_VELOCITY_DIFF_MS || v_behind > Road::SPEED_LIMIT_MPS ? Road::SPEED_LIMIT_MPS : v_behind);
         else {
             // there are vehicles ahead only or both ahead and behind
-            this->lane_speeds[i] = v_ahead;
+            this->lane_speeds[i] = v_ahead > Road::SPEED_LIMIT_MPS ? Road::SPEED_LIMIT_MPS : v_ahead;
         }
 
         //TODO  cout << ", lsp: ";
@@ -638,53 +684,60 @@ void Ego::calculate_lane_speeds() {
 
 void Ego::set_cars_ahead_and_behind() {
     for (int i = 0; i < Road::NUM_LANES; ++i) {
-        Car car_ahd;
-        this->get_vehicle_ahead((Road::LANE) i, car_ahd);
+        Car car_ahd, car_beh;
+
+        auto it = this->other_cars_lane_map.find((Road::LANE)i);
+        if (it != this->other_cars_lane_map.end()) {
+            // cars in the lane
+            for (const auto &c : it->second) {
+                double ds = frenetCircSDistanceBetweenCars(this->s, c.getS());
+                if (ds >= 0) // Ego is ahead of the car c
+                    car_beh = c;
+                else {
+                    car_ahd = c;
+                    break;
+                }
+            }
+        }
         this->cars_ahead[i] = car_ahd;
-
-        if (car_ahd.getId() >= 0)
-            cout << "Ahead: Lane: " << car_ahd.getLane() << ", id: " << car_ahd.getId() << ", s: " << car_ahd.getS() << ", ego.s: " << this->s << endl;
-
-        Car car_beh;
-        this->get_vehicle_behind((Road::LANE) i, car_beh);
         this->cars_behind[i] = car_beh;
 
+        //TODO rem
+        if (car_ahd.getId() >= 0)
+            cout << "Ahead: Lane: " << car_ahd.getLane() << ", id: " << car_ahd.getId() << ", c.s: " << car_ahd.getS()
+            << ", c.d: " << car_ahd.getD() << ", c.v: " << car_ahd.getVel()
+            << ", ego.s: " << this->s << ", ego.d: " << this->d << ", ego.v: " << this->vel << endl;
+
+        //TODO rem
         if (car_beh.getId() >= 0)
-            cout << "Behind: Lane: " << car_beh.getLane() << ", id: " << car_beh.getId() << ", s: " << car_beh.getS() << ", ego.s: " << this->s << endl;
+            cout << "Behind: Lane: " << car_beh.getLane() << ", id: " << car_beh.getId() << ", s: " << car_beh.getS()
+                << ", c.d: " << car_beh.getD() << ", c.v: " << car_beh.getVel()
+                << ", ego.s: " << this->s << ", ego.d: " << this->d << ", ego.v: " << this->vel << endl;
     }
 }
 
-// Calculate circular distance between cars.
-// Account for the cars on the different sides of MAX_S.  After MAX_S, the simulator returns 0.
-// if car1 is ahead of car2, return distance > 0, otherwise < 0
-double Ego::frenetCircSDistanceBetweenCars(const double car1_s, const double car2_s) {
-    double circ_dist1 = car1_s - car2_s;
-    double circ_dist2 = Road::MAX_S - abs(circ_dist1);
-    return abs(circ_dist1) < circ_dist2 ? circ_dist1 : (circ_dist1 < 0 ? circ_dist2 : -1*circ_dist2);
-}
-
+// Calculate the cost of the trajectory's path and return the path by reference via ret_traj_path
 double
-Ego::calculate_traj_path_cost(const Ego::Trajectory &trajectory, map<int, vector<Car>> &other_car_predictions, Ego::Path &traj_path) {
-    traj_path = getPath(trajectory);
+Ego::calculate_traj_path_cost(Ego::Trajectory &trajectory) {
     double cost = 0.0;
 
-    auto& costType_weight_map = COST_WEIGHT_LIST.at(trajectory.state);
+    auto& costType_weight_map = COST_WEIGHT_MAP.at(trajectory.target_state);
     for (auto& ctw : costType_weight_map) {
         Ego::COST_TYPES ct = ctw.first;
         double weight = ctw.second;
-        double new_cost = weight * COST_FUNC_MAP.at(ct)(*this, trajectory, traj_path, other_car_predictions);
+        double new_cost = weight * COST_FUNC_MAP.at(ct)(*this, trajectory);
         cost += new_cost;
     }
 
     return cost;
 }
 
-double Ego::inefficiency_cost(const Ego::Trajectory &trajectory, const Ego::Path &traj_path,
-                              const map<int, vector<Car>> &other_car_predictions) {
-    double maxSpeed = -1;
-    int maxSpeedLane = -1;
+double Ego::inefficiency_cost(const Ego::Trajectory &trajectory) {
+    double maxSpeed = this->lane_speeds[trajectory.target_lane];
+    int maxSpeedLane = trajectory.target_lane;
     for (int i=0; i < Road::NUM_LANES; ++i) {
-        if (this->lane_speeds[i] > maxSpeed) {
+        // in order to register more efficient lane, the velocity difference has to be significant: > LANE_CHANGE_TRIGGER_VELOCITY_DIFF_MS
+        if (this->lane_speeds[i] > maxSpeed + Ego::LANE_CHANGE_TRIGGER_VELOCITY_DIFF_MS) {
             maxSpeed = this->lane_speeds[i];
             maxSpeedLane = i;
         }
@@ -693,44 +746,68 @@ double Ego::inefficiency_cost(const Ego::Trajectory &trajectory, const Ego::Path
     assert(maxSpeed > 0);
 
     double cost = 0;
-    if (maxSpeed - this->lane_speeds[this->lane] > Ego::LANE_CHANGE_TRIGGER_VELOCITY_DIFF_MS) {
+    bool isEgoInLaneChangeState = this->isInLaneChangeState();
+    // case 1: in any state, the max speed has to be significantly higher than the current lane
+    // case 2: in LC state, we are committed to changing lanes unless a collision is imminent. After starting LC,
+    // inefficiency is calculated ONLY based on the target lane vs the starting lane.
+    if (maxSpeed - this->lane_speeds[this->lane] > Ego::LANE_CHANGE_TRIGGER_VELOCITY_DIFF_MS || isEgoInLaneChangeState) {
         cost = (double) abs(maxSpeedLane - (int) trajectory.target_lane) / (Road::NUM_LANES - 1.);
-        //TODO vel ineff cost *= fabs(maxSpeed - this->targetVel);
     }
+    cout << "inefficiency_cost: lane speed cost: " << cost;
 
-    cout << "inefficiency_cost: " << cost << endl;
+    // this part adjusts behaviour in which Ego tries to match the speed of the target lane in PLC state before it
+    // catches up to the vehicle far ahead in its own lane.
+    if (trajectory.target_state == Ego::FSM_STATES::KL && !isEgoInLaneChangeState) {
+        Car& car_ahd = this->cars_ahead[this->lane];
+
+        if (car_ahd.getId() >= 0) {
+            double car_ahd_dist = frenetCircSDistanceBetweenCars(car_ahd.getS(), this->s);
+            if (car_ahd_dist > Ego::PREFERRED_VEHICLE_FOLLOWING_DISTANCE) {
+                // there's a car ahead further then preferred distance.  Inefficiency drops, as Ego has space to maneuver.
+                double following_cost = 1 - 0.7 * (car_ahd_dist - Ego::PREFERRED_VEHICLE_FOLLOWING_DISTANCE)
+                        / (Ego::OTHER_CAR_DETECTION_HORIZON - Ego::PREFERRED_VEHICLE_FOLLOWING_DISTANCE);
+                cout << ", following_cost: " << following_cost;
+                cost *= following_cost;
+            }
+        }
+    }
+    cout << ", final cost: " << cost << endl;
     return cost;
 }
 
 // 1 - collision. 0 - distance is greater than min
-double Ego::collision_and_proximity_cost(const Ego::Trajectory &trajectory, const Ego::Path &ego_path,
-                                         const map<int, vector<Car>> &other_car_predictions) {
+double Ego::collision_and_proximity_cost(Ego::Trajectory &trajectory) {
     double max_cost = 0;
-    for (auto const & pred : other_car_predictions) {
-        assert(ego_path.pts_x.size() == pred.second.size() && ego_path.pts_s.size() == ego_path.pts_x.size());
+    const vector<Car::Position> &ego_path = trajectory.path;
+    for (const auto & oc_it : this->other_cars_id_map) {
+        const vector<Car::Position> &oc_pred = oc_it.second.getPrediction();
+        
+        assert(ego_path.size() >= Ego::PREDICTION_NEAR_HORIZON_TICKS && oc_pred.size() >= Ego::PREDICTION_NEAR_HORIZON_TICKS);
 
         double cost = 0;
-        for (int p = 0; p < ego_path.pts_s.size(); ++p) {
-            double es = ego_path.pts_s[p];
-            double ed = ego_path.pts_d[p];
+        //check for collision in the range of PREDICTION_NEAR_HORIZON_SEC ahead
+        for (int tk = 0; tk < Ego::PREDICTION_NEAR_HORIZON_TICKS; ++tk) {
+            double es = ego_path[tk].pt_s;
+            double ed = ego_path[tk].pt_d;
 
-            Car car = pred.second[p];
-            double cs = car.getS();
-            double cd = car.getD();
+            double cs = oc_pred[tk].pt_s;
+            double cd = oc_pred[tk].pt_d;
             auto ego_lane = (Road::LANE)(ed / Road::LANE_WIDTH);
-            double delta_s = abs(Ego::frenetCircSDistanceBetweenCars(es, cs));
-            double delta_d = abs(ed - cd);
+            double delta_s = frenetCircSDistanceBetweenCars(es, cs);  // if delta_s > 0, ego is ahead of the car
+            double abs_delta_s = abs(delta_s);
+            double delta_d = ed - cd;
+            double abs_delta_d = abs(delta_d);
 
-            // s coord proximity cost
-            if (delta_s < Ego::IN_LANE_COLLISION_DISTANCE && delta_d < Ego::SIDE_COLLISION_DISTANCE) {
-                cout << "collision_and_proximity_cost: 1" << endl;
+            // collision cost
+            if (abs_delta_s < Ego::IN_LANE_COLLISION_DISTANCE && abs_delta_d < Ego::SIDE_COLLISION_DISTANCE) {
+                trajectory.potential_collision_car_id = oc_it.first;
+                cout << "COLLN collision_and_proximity_cost: 1, car id: " << oc_it.first << endl;
                 return 1.;
             }
-            else if (delta_s < Ego::MIN_VEHICLE_FOLLOWING_DISTANCE) {
-                bool isLaneChangeState =
-                    trajectory.state == Ego::FSM_STATES::LCL || trajectory.state == Ego::FSM_STATES::LCR;
-                if (ego_lane == car.getLane() || (isLaneChangeState && trajectory.target_lane == car.getLane()))
-                    cost = 1. - delta_s / Ego::MIN_VEHICLE_FOLLOWING_DISTANCE;
+            else if (abs_delta_s < Ego::MIN_VEHICLE_FOLLOWING_DISTANCE) {
+                bool isLaneChangeTrajState = Ego::isInLaneChangeState(trajectory.target_state);
+                if (ego_lane == oc_it.second.getLane() || (isLaneChangeTrajState && trajectory.target_lane == oc_it.second.getLane()))
+                    cost = 1. - abs_delta_s / Ego::MIN_VEHICLE_FOLLOWING_DISTANCE;
             }
 
             if (cost > max_cost)
@@ -741,89 +818,300 @@ double Ego::collision_and_proximity_cost(const Ego::Trajectory &trajectory, cons
     }
 
     cout << "collision_and_proximity_cost: " << max_cost << endl;
+    assert(max_cost >= 0 && max_cost < 1.01);
 
     return max_cost;
 }
 
-// Cost: 0 - 1.  This cost increase forces the car towards LC state.  The closer the car matches the target lane speed.
-double Ego::lane_change_readiness_cost(const Ego::Trajectory &trajectory, const Ego::Path &traj_path,
-                                 const map<int, vector<Car>> &other_car_predictions) {
+// Cost: 0 - 1.  This cost increase forces the car towards LC state.  The closer ego matches the target lane speed,
+// the more likely it is to go into LC state.
+double Ego::lane_change_readiness_cost(const Ego::Trajectory &trajectory) {
+    if (!this->isInPrepLaneChangeState())
+        return 0;   //cost function is only activated when Ego is in PLC state
+
     Road::LANE intended_lane = trajectory.target_lane;
-    Car &car_ah = this->cars_ahead[intended_lane];
+    Car &car_ahd = this->cars_ahead[intended_lane];
     Car &car_beh = this->cars_behind[intended_lane];
 
-    if (car_ah.getId() < 0 && car_beh.getId() < 0) {
-        cout << "lane_change_readiness_cost: 1" << endl;
-        // no vehicles ahead or behind
+    if (car_beh.getVel() > Road::SPEED_LIMIT_MPS) {
+        cout << "lane_change_readiness_cost: 0." << endl;
+        // car behind is going too fast.  Don't get ahead of it.
+        return 0.;
+    }
+
+    if (car_ahd.getId() < 0 &&
+        (car_beh.getId() < 0 || car_beh.getVel() < this->vel)) {
+        cout << "lane_change_readiness_cost: 1." << endl;
+        // no vehicles ahead or behind OR the vehicle behind is far enough.
         return 1.;
     }
 
-    double cost = exp(-abs(this->targetVel - this->lane_speeds[intended_lane]));
+    double cost = exp(-abs(this->controller.getTargetVel() - this->lane_speeds[intended_lane]));
 
     cout << "lane_change_readiness_cost: " << cost << endl;
 
     return cost;
 }
 
-// off center cost (0-1) used to drive from LC to KL states and prevent KL->PLC before the car is at the center of
-// the intended lane. 1 is the cost near center of intended lane. 0 is over the lane
-double Ego::off_center_lane_cost(const Ego::Trajectory &trajectory, const Ego::Path &traj_path,
-                             const map<int, vector<Car>> &other_car_predictions) {
-    assert(trajectory.target_lane == this->lane);
+// This cost is calculated only for PLC states in order to prevent KL state going into PLC before the car
+// reaches the center of the lane.  Cost 1 - 2m from lane cntr, 0 - at lane ctr.
+double Ego::lane_off_center_cost(const Ego::Trajectory &trajectory) {
+    assert(trajectory.target_state == Ego::FSM_STATES::PLCR || trajectory.target_state == Ego::FSM_STATES::PLCL);
 
+    double cost = 0;
     double half_lane_width = Road::LANE_WIDTH / 2.;
-    double mid_curr_lane = Road::LANE_WIDTH * this->lane + half_lane_width;
-    double cost = abs(this->d - mid_curr_lane) / half_lane_width;
+    double mid_lane = this->lane*Road::LANE_WIDTH + half_lane_width;
+    cost  = abs(this->d - mid_lane) / half_lane_width;
 
     cout << "off_center_lane_cost: " << cost << endl;
     return cost;
 }
 
+/**
+ * After LC, try to keep Ego in KL state around Ego::MIN_KL_TIME_AFTER_LC_MILLIS.  Cost=1 when
+ * Ego::MIN_KL_TIME_AFTER_LC_MILLIS timer starts; cost=0 after Ego::MIN_KL_TIME_AFTER_LC_MILLIS milliseconds have passed.
+ *
+ * @param trajectory
+ * @param traj_path
+ * @param other_car_predictions
+ * @return cost depending on number millis passed on the timer.
+ */
+double Ego::lane_weaving_cost(const Ego::Trajectory &trajectory) {
+    double cost = 0;
+
+    std::chrono::duration<double, std::milli> KL_state_millis =  std::chrono::high_resolution_clock::now() - this->KL_state_start_timepoint;
+    long millis = KL_state_millis.count();
+
+    if (millis < Ego::MIN_KL_TIME_AFTER_LC_MILLIS && this->fsm_state == Ego::FSM_STATES::KL &&
+        Ego::isInPrepLaneChangeState(trajectory.target_state))
+        cost = (double)(Ego::MIN_KL_TIME_AFTER_LC_MILLIS - millis)/Ego::MIN_KL_TIME_AFTER_LC_MILLIS;
+
+    cout << "lane_weaving_cost: " << cost << endl;
+    return cost;
+}
+
+//TODO rem? Excessive jerk and acceleration cost. 1 - jerk exceeds 10 m/s^3 or accle > 10/m/s^2
+/*double Ego::out_of_lane_and_accel_spline_cost(const Ego::Trajectory &trajectory) {
+    double divider_touch_d1, divider_touch_d2;
+
+    if (trajectory.target_state == Ego::FSM_STATES::LCL) {
+        Road::LANE start_lane = this->lane;
+        if (this->laneCrossedInLCState)
+            start_lane = (Road::LANE) (start_lane + 1);
+        divider_touch_d1 = start_lane * Road::LANE_WIDTH - Ego::SIDE_COLLISION_DISTANCE/2.;
+        divider_touch_d2 = start_lane * Road::LANE_WIDTH + Ego::SIDE_COLLISION_DISTANCE/2.;
+    } else if (trajectory.target_state == Ego::FSM_STATES::LCR) {
+        divider_touch_d1 = trajectory.target_lane * Road::LANE_WIDTH - Ego::SIDE_COLLISION_DISTANCE/2.;
+        divider_touch_d2 = trajectory.target_lane * Road::LANE_WIDTH + Ego::SIDE_COLLISION_DISTANCE/2.;
+    }
+    else if (trajectory.target_state == Ego::FSM_STATES::KL) {
+        divider_touch_d1 = trajectory.target_lane * Road::LANE_WIDTH + Ego::SIDE_COLLISION_DISTANCE/2.;
+        divider_touch_d2 = (trajectory.target_lane+1) * Road::LANE_WIDTH - Ego::SIDE_COLLISION_DISTANCE/2.;
+    }
+    else
+        throw std::runtime_error(
+            "ERROR: out_of_lane_and_accel_spline_cost state " + std::to_string((int) trajectory.target_state) + " is invalid. Exiting..");
+
+    assert(divider_touch_d1 >=0 && divider_touch_d1 < Road::NUM_LANES*Road::LANE_WIDTH);
+    assert(divider_touch_d2 >=0 && divider_touch_d2 < Road::NUM_LANES*Road::LANE_WIDTH);
+
+
+    double max_atot = 0;
+    double lc_tick_cnt = 0;
+
+    //TODO rem
+    cout << ">>> accel&time <<<" << endl;
+
+    // calculate max total acceleration of the path and the time the ego is touching the dividing line
+    for (u_int p = 0; p < Car::PREDICTION_FAR_HORIZON_TICKS - 2; ++p) {
+        Car::Position pos1 = traj_path[p];
+        Car::Position pos2 = traj_path[p+1];
+        Car::Position pos3 = traj_path[p+2];
+
+        // accel limit
+        double R = Ego::estimate_curve_radius(pos1, pos2, pos3);
+        double v1 = distance(pos1.pt_x, pos1.pt_y, pos2.pt_x, pos2.pt_y)/DT;
+        double v2 = distance(pos2.pt_x, pos2.pt_y, pos3.pt_x, pos3.pt_y)/DT;
+        double ave_v = (v1 + v2)/2.;
+
+        double an = ave_v*ave_v/R;
+        double at = abs(v2 - v1)/DT;
+        double atot = sqrt(an*an + at*at);
+
+        //TODO rem
+        //cout << "an: " << an << ", at: " << at << ", atot: " << atot << endl;
+
+        if (atot > max_atot)
+            max_atot = atot;
+
+        // time limit
+        if ((Ego::isInLaneChangeState(trajectory.target_state) && pos1.pt_d >= divider_touch_d1 && pos1.pt_d <= divider_touch_d2)
+            || (trajectory.target_state == Ego::FSM_STATES::KL && (pos1.pt_d <= divider_touch_d1 || pos1.pt_d >= divider_touch_d2)))
+            lc_tick_cnt++;
+
+        if (max_atot > Ego::MAX_ACCEL) {
+            cout << "St: " << int(trajectory.target_state) << "| out_of_lane_and_accel_spline_cost (Max accel exceeded): " << max_atot << endl;
+            return 1.;
+        }
+
+        double lc_time_sec = lc_tick_cnt * DT;
+
+        //TODO rem
+        //cout << "|| pos1.pt_d: " << pos1.pt_d << ", div_d1: " <<  divider_touch_d1 << ", div_d2: " << divider_touch_d2
+        //<< ", lc_tick_cnt: " << lc_tick_cnt << ", lc_time_sec: " << lc_time_sec << endl;
+
+
+        if (lc_time_sec > Ego::MAX_TOTAL_LANE_CHANGE_TIME_SEC) {
+            cout << "out_of_lane_and_accel_spline_cost (lc time exceeded): " << lc_time_sec << endl;
+            return 1.; 
+        }
+    }
+
+    double acost = max_atot / Ego::MAX_ACCEL;
+    double tcost = lc_tick_cnt * DT / Ego::MAX_TOTAL_LANE_CHANGE_TIME_SEC;
+    double cost = (acost + tcost) / 2.;
+
+    cout << "out_of_lane_and_accel_spline_cost: acost: " << acost << ", tcost: " << tcost << ", cost: " << cost << endl;
+    return cost;
+}*/
+
 void Ego::recordIncident() {
     // collision
-    for (auto const & oc : this->other_cars) {
+    for (auto const & oc : this->other_cars_id_map) {
         double es = this->s;
         double ed = this->d;
 
         Car car = oc.second;
         double cs = car.getS();
         double cd = car.getD();
-        double delta_s = abs(Ego::frenetCircSDistanceBetweenCars(es, cs));
+        double delta_s = abs(frenetCircSDistanceBetweenCars(es, cs));
         double delta_d = abs(ed - cd);
 
-       /*TODO cout << "colln?: id: " << car.getId() << ", ds: " << delta_s << ", dd: " << delta_d << ", c.ln: " << car.getLane()
-        << ", eg.s: " << this->s << ", eg.d: " << this->d << ", e.lane: " << this->lane << ", elane: " << ego_lane << endl;*/
+        /*TODO cout << "colln?: id: " << car.getId() << ", ds: " << delta_s << ", dd: " << delta_d << ", c.ln: " << car.getLane()
+         << ", eg.s: " << this->s << ", eg.d: " << this->d << ", e.lane: " << this->lane << ", elane: " << ego_lane << endl;*/
 
-       if (delta_s < Ego::IN_LANE_COLLISION_DISTANCE && delta_d < Ego::SIDE_COLLISION_DISTANCE) {
+        if (delta_s < Ego::IN_LANE_COLLISION_DISTANCE && delta_d < Ego::SIDE_COLLISION_DISTANCE) {
             std::cerr << "COLLISION with car id:" << car.getId() << ".  Exiting.." << endl;
             exit(0);
         }
     }
-
-/*TODO    double dt = DT;
-    if (!prevTSet) {
-        this->prevTSet = true;
-    }
-    else
-        dt = (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - this->prev_t).count())/1000.;
-    this->prev_t = std::chrono::steady_clock::now();*/
-
-    cout << "ACCEL: " << getEstimatedAccel() << endl;
-    // accel exceeded
-    /*double curr_accel = getEstimatedAccel();
-    if (this->prev_vel != 0 && abs(curr_accel) > Ego::MAX_ACCEL) {
-        cout << "dt: " << dt << endl;
-        std::cerr << "Exceeded accel. limit: vel: " << this->vel << ", prev_vel: " << this->prev_vel << ".  Exiting.." << endl;
-        exit(0);    
-    }
-    
-    //jerk exceeded
-    if (this->prev_accel != INT_MAX && abs(curr_accel - this->prev_accel)/DT > Ego::MAX_JERK) {
-        std::cerr << "Exceeded jerk limit: curr_accel: " << curr_accel << ", prev_acc: " << this->prev_accel << ".  Exiting.." << endl;
-        exit(0);
-    }*/
 }
 
+// Estimate curve radius based on 3 points.  Use Heron's formula to find the triangle's height.  The height is used
+// to estimate the arc radius.
+double
+Ego::calculateCurveRadius(const double x0, const double y0, const double x1, const double y1, const double x2, const double y2) {
+    double d1 = distance(x0, y0, x1, y1);
+    double d2 = distance(x1, y1, x2, y2);
+    double w = distance(x0, y0, x2, y2);
+
+    // use Heron's formula to obtain height of the triangle between 3 points
+    double hp = (d1 + d2 + w)/2.;   // half perimeter
+    double area = sqrt(hp * (hp - d1) * (hp - d2) * (hp - w));  // Heron's formula for a triangle area
+    double h = 2 * area / w;   // height of triangle
+    double arc_r = h/2. + w*w/(8.*h);    // radius of an arc formula based on a chord theorem: https://www.mathopenref.com/arcradius.html
+
+    if (isnan(arc_r))
+        arc_r = INFINITY;
+    return arc_r;
+}
+
+bool Ego::isInLaneChangeState() {
+    return Ego::isInLaneChangeState(this->fsm_state);
+}
+
+bool Ego::isInLaneChangeState(const Ego::FSM_STATES st) {
+    return st == Ego::FSM_STATES::LCL || st == Ego::FSM_STATES::LCR;
+}
+
+bool Ego::isInPrepLaneChangeState() {
+    return Ego::isInLaneChangeState(this->fsm_state);
+}
+bool Ego::isInPrepLaneChangeState(const Ego::FSM_STATES st) {
+    return st == Ego::FSM_STATES::PLCL || st == Ego::FSM_STATES::PLCR;
+}
+
+double Ego::estimate_curve_radius(const Car::Position p1, const Car::Position p2, const Car::Position p3) {
+    double phi1 = atan2(p2.pt_y - p1.pt_y, p2.pt_x - p1.pt_x);
+    double phi2 = atan2(p3.pt_y - p2.pt_y, p3.pt_x - p2.pt_x);
+    double dphi_rad = abs(phi2 - phi1);
+    double dx = distance(p1.pt_x, p1.pt_y, p3.pt_x, p3.pt_y);
+
+    double R = dx / dphi_rad;
+    return R;
+}
+
+double Ego::get_max_tot_accel(const Trajectory &trajectory) {
+    double max_atot = 0;
+    
+    // calculate max total acceleration of the path 
+    for (u_int p = 0; p < Car::PREDICTION_FAR_HORIZON_TICKS - 2; ++p) {
+        Car::Position pos1 = trajectory.path[p];
+        Car::Position pos2 = trajectory.path[p+1];
+        Car::Position pos3 = trajectory.path[p+2];
+
+        // accel limit
+        double R = Ego::estimate_curve_radius(pos1, pos2, pos3);
+        double v1 = distance(pos1.pt_x, pos1.pt_y, pos2.pt_x, pos2.pt_y)/DT;
+        double v2 = distance(pos2.pt_x, pos2.pt_y, pos3.pt_x, pos3.pt_y)/DT;
+        double ave_v = (v1 + v2)/2.;
+
+        double an = ave_v*ave_v/R;
+        double at = abs(v2 - v1)/DT;
+        double atot = sqrt(an*an + at*at);
+
+        //TODO rem
+//        if (atot > MAX_ACCEL)
+//            cout << "an: " << an << ", at: " << at << ", atot: " << atot << endl;
+
+        if (atot > max_atot)
+            max_atot = atot;
+     }
+
+    return max_atot;
+
+}
+
+double Ego::get_out_of_lane_time(const Ego::Trajectory &trajectory) {
+    double divider_touch_d1, divider_touch_d2;
+
+    if (trajectory.target_state == Ego::FSM_STATES::LCL) {
+        Road::LANE start_lane = this->lane;
+        if (this->laneCrossedInLCState)
+            start_lane = (Road::LANE) (start_lane + 1);
+        divider_touch_d1 = start_lane * Road::LANE_WIDTH - Ego::SIDE_COLLISION_DISTANCE/2.;
+        divider_touch_d2 = start_lane * Road::LANE_WIDTH + Ego::SIDE_COLLISION_DISTANCE/2.;
+    } else if (trajectory.target_state == Ego::FSM_STATES::LCR) {
+        divider_touch_d1 = trajectory.target_lane * Road::LANE_WIDTH - Ego::SIDE_COLLISION_DISTANCE/2.;
+        divider_touch_d2 = trajectory.target_lane * Road::LANE_WIDTH + Ego::SIDE_COLLISION_DISTANCE/2.;
+    }
+    else if (trajectory.target_state == Ego::FSM_STATES::KL) {
+        divider_touch_d1 = trajectory.target_lane * Road::LANE_WIDTH + Ego::SIDE_COLLISION_DISTANCE/2.;
+        divider_touch_d2 = (trajectory.target_lane+1) * Road::LANE_WIDTH - Ego::SIDE_COLLISION_DISTANCE/2.;
+    }
+    else
+        throw std::runtime_error(
+            "ERROR: out_of_lane_and_accel_spline_cost state " + std::to_string((int) trajectory.target_state) + " is invalid. Exiting..");
+
+    assert(divider_touch_d1 >=0 && divider_touch_d1 < Road::NUM_LANES*Road::LANE_WIDTH);
+    assert(divider_touch_d2 >=0 && divider_touch_d2 < Road::NUM_LANES*Road::LANE_WIDTH);
+
+    // calculate the time the ego is touching the dividing line
+    double lc_tick_cnt = 0;
+    for (u_int p = 0; p < Car::PREDICTION_FAR_HORIZON_TICKS - 2; ++p) {
+        Car::Position pos1 = trajectory.path[p];
+        // time limit
+        if ((Ego::isInLaneChangeState(trajectory.target_state) && pos1.pt_d >= divider_touch_d1 && pos1.pt_d <= divider_touch_d2)
+            || (trajectory.target_state == Ego::FSM_STATES::KL && (pos1.pt_d <= divider_touch_d1 || pos1.pt_d >= divider_touch_d2)))
+            lc_tick_cnt++;
+
+        //TODO rem
+        //cout << "|| pos1.pt_d: " << pos1.pt_d << ", div_d1: " <<  divider_touch_d1 << ", div_d2: " << divider_touch_d2
+        //<< ", lc_tick_cnt: " << lc_tick_cnt << ", lc_time_sec: " << lc_time_sec << endl;
+    }
+    
+    return lc_tick_cnt * DT;
+}
 
 
 
