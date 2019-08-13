@@ -27,7 +27,7 @@ using std::endl;
 
 class Ego : virtual public Car {
 public:
-    constexpr static double MAX_ACCEL = 10.00;              // m/s**2
+    constexpr static double MAX_ACCEL = 9.5;              // m/s**2
     constexpr static double MAX_JERK = 9.99;               // m/s**3
     constexpr static double MAX_TIME_OUT_OF_LANE = 3.0;    // sec
 
@@ -50,7 +50,7 @@ public:
 
     constexpr static double LANE_CHANGE_TRIGGER_VELOCITY_DIFF_MS = 1;    //
 
-    constexpr static long MIN_KL_TIME_AFTER_LC_MILLIS = 10000;   // After switching from LC, stay in KL state these many
+    constexpr static long MIN_KL_TIME_AFTER_LC_MILLIS = 5000;   // After switching from LC, stay in KL state these many
                                                                 // milliseconds unless there's a collision.
 
     // "Out of lane time" is when Ego touches the lane dividing line.  Here, I'm approximating the maximum total lane
@@ -221,15 +221,9 @@ private:
 
     // MIN_COLLISION_COST should be the highest cost; it should be higher than the sum of all non-colln costs in every state.
     // PLC and LC states should have higher collision cost than KL, so that when collision/proximity cost is significant,
-    // KL should be the highly preferred state.  I had to decide on a MIN_COLLISION_COST multiplication coeff. for PLC/LC states.
-    // Inefficiency cost leading to PLC/LC states is normally (0.5 or 1)*"inefficiency cost weight", which is 1.5 or 3 with weight of 3.
-    // ("PLC colln cost weight" - "KL colln cost weight") * "significant colln/proximity cost" needs to be higher than inefficiency cost (1.5 or 3).
-    // That is, ("PLC colln cost weight" - "KL colln cost weight") should be > 3/"significant colln/proximity cost" OR
-    // (coeff*MIN_COLLISION_COST - MIN_COLLISION_COST) > 3/0.15, where 0.15 is the significant colln/proximity cost.
-    // Note: "significant colln/proximity cost" should be about the same for PLC and KL states.
-    // coeff = 1 + 3/(0.15*MIN_COLLISION_COST).  For inefficiency cost of 1.5, "significant colln/proximity cost" is .08
+    // KL should be the highly preferred state.  I had to decide on a MIN_COLLISION_COST multiplication coeff. for PLC/LC states by trial.
     const int MIN_COLLISION_COST = 9;
-    const double LC_COLLN_COEFF = 1 + 3/(0.15*MIN_COLLISION_COST);
+    const double LC_COLLN_COEFF = 2;
     const map<Ego::FSM_STATES, map<COST_TYPES, double>> COST_WEIGHT_MAP =
         {{Ego::FSM_STATES::KL, {{COLLISION_COST, MIN_COLLISION_COST}, {INEFFICIENCY_COST, 3}}},
          {Ego::FSM_STATES::PLCL, {{COLLISION_COST, LC_COLLN_COEFF*MIN_COLLISION_COST}, {INEFFICIENCY_COST, 3}, {PREPARE_LANE_CHANGE_COST,1},   {OFF_LANE_CENTER_COST,  2}, {LANE_WEAVING_COST, 4}}},

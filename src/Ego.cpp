@@ -639,7 +639,8 @@ double Ego::collision_and_proximity_cost(Ego::Trajectory &trajectory) {
                 cout << "COLLN collision_and_proximity_cost: 1, car id: " << oc_it.first << endl;
                 return 1.;
             }
-            else if (abs_delta_s < Ego::MIN_VEHICLE_FOLLOWING_DISTANCE) {
+
+            if (abs_delta_s < Ego::MIN_VEHICLE_FOLLOWING_DISTANCE) {
                 bool isLaneChangeTrajState = Ego::isInLaneChangeState(trajectory.target_state);
                 if (ego_lane == oc_it.second.getLane() || (isLaneChangeTrajState && trajectory.target_lane == oc_it.second.getLane()))
                     cost = 1. - abs_delta_s / Ego::MIN_VEHICLE_FOLLOWING_DISTANCE;
@@ -651,8 +652,6 @@ double Ego::collision_and_proximity_cost(Ego::Trajectory &trajectory) {
     }
 
     cout << "collision_and_proximity_cost: " << max_cost << endl;
-    assert(max_cost >= 0 && max_cost < 1.01);
-
     return max_cost;
 }
 
