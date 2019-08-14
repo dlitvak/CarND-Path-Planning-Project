@@ -7,10 +7,10 @@ project implementation.  For the proper intro and the info on how to run the pro
 
 ## Project Files
 * [main.cpp](./src/main.cpp) - Main function interacting with the simulator and calling on Ego class to provide best path.
-* [Car.cpp](./src/Car.cpp), [Car.h](./src/Car.h) - the base class representing the vehicles and predicting their path.
+* [Car.cpp](./src/Car.cpp), [Car.h](./src/Car.h) - the base class representing the vehicles and predicting their paths.
 * [Ego.cpp](./src/Ego.cpp), [Ego.h](./src/Ego.h) - Ego class inheriting from Car.  It implements the planner.
-* [Road.cpp](./src/Road.cpp), [Road.h](./src/Road.h) - The class containing Road characteristics: lane width, number of lanes.
-* [helpers.h](./src/helpers.h) - Utility functions mostly from Udacity.  I added a function to calculate circ. track Frenet distance between cars.
+* [Road.cpp](./src/Road.cpp), [Road.h](./src/Road.h) - The class containing Road information: lane width, number of lanes, map points.
+* [helpers.h](./src/helpers.h) - Utility functions mostly from Udacity.  I added a function to calculate circular track Frenet distance between cars.
 * [spline.h](./src/spline.h) - The code adopted to create smooth spline path curves.
 
 
