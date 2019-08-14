@@ -32,17 +32,17 @@ function [here](https://github.com/dlitvak/CarND-Path-Planning-Project/blob/mast
 Each transition is decided on the basis of the current Ego state and on the basis of the cumulative transition/state costs.
 Cumulative state costs are obtained by adding the cost function results (0 - 1 range) multiplied by the corresponding weights.
 The successor state that has the lowest cumulative cost becomes the next Ego's state.
-The FSM diagram lists the cost functions in the callouts connected to the states.  In the code, you can find these implemented
+The FSM diagram lists the cost functions in the callouts connected to the states.  In the code, you can find the cost calculation implemented
 in Ego.cpp calculate_traj_path_cost function [here](https://github.com/dlitvak/CarND-Path-Planning-Project/blob/master/src/Ego.cpp#L556).
 
 Here is the list of the cost functions and their purposes:
-* [inefficiency_cost](https://github.com/dlitvak/CarND-Path-Planning-Project/blob/master/src/Ego.cpp#L570) - decides whether Ego should change the lane based on the estimated lane speeds. 0 - Ego is in the highest lane speed, 1 - the highest speed lane is at the otehr side of the road.
+* [inefficiency_cost](https://github.com/dlitvak/CarND-Path-Planning-Project/blob/master/src/Ego.cpp#L570) - decides whether Ego should change the lane based on the estimated lane speeds. 0 - Ego is in the highest speed lane, 1 - the highest speed lane is at the other side of the road.
 * [collision_and_proximity_cost](https://github.com/dlitvak/CarND-Path-Planning-Project/blob/master/src/Ego.cpp#L614) - looks at the Ego state path and the other car predicted paths (spline lib).  It decides if in the near future there is an imminent collision (1) or a car gets too close to Ego (0 - 1).
-* [lane_change_readiness_cost](https://github.com/dlitvak/CarND-Path-Planning-Project/blob/master/src/Ego.cpp#L660) - evaluates how close Ego matches the speed of the lane where it tries to merge. 1 - the target lane speed matches: it's better to go from PLC to LC state.
+* [lane_change_readiness_cost](https://github.com/dlitvak/CarND-Path-Planning-Project/blob/master/src/Ego.cpp#L660) - evaluates how close Ego matches the speed of the lane where it tries to merge. 1 - the target lane speed matches: LC state is preferred to PLC.
 * [lane_off_center_cost](https://github.com/dlitvak/CarND-Path-Planning-Project/blob/master/src/Ego.cpp#L690) - evaluates the cost of being off center in PLC state.  This was introduced to prevent rapid LC->KL->PLC->LC switching until Ego reaches the middle of the lane in KL state.
 * [lane_weaving_cost](https://github.com/dlitvak/CarND-Path-Planning-Project/blob/master/src/Ego.cpp#L711) - time based cost function to limit dangerous weaving between lanes.  It increases PLC cost for a length of time to prevent rapid LC->KL->PLC->LC switching again.
 
-Even though the same cost functions (inefficiency_cost and collision_and_proximity_cost) are applied to multiple states,
+Even though the same cost functions (inefficiency_cost & collision_and_proximity_cost) are applied to multiple states,
 the car's behavior is adjusted by the differing cost weights associated with each state.  For e.g. collision cost weight
 is higher in LC/PLC than in KL state.  This is in order to encourage Ego to stay in the same lane and lower its speed if a
 collision is imminent.
@@ -51,18 +51,20 @@ In the code, the cost weights are listed in Ego.h [here](https://github.com/dlit
 
 ## Dealing with Excessive Acceleration and Max Out-of-Lane Time Requirements
 
-I started the project by first trying to keep the car driving without collisions not paying attention to acceleration.
+I started the project by first trying to keep the car driving without collisions, not paying attention to acceleration.
 After succeeding to drive 340+ miles without collision (I stopped simulation), I thought I was done.  Not so fast!
 Measuring the centripetal forces in KL and LC states proved to be as hard as driving without collisions.  The problem was that
 I did not know how the simulator measured acceleration.  I had to come up with an estimate mirroring acceleration calculations in the simulator.
-In the end, I chose a formula in the lecture Feasibility slide to evaluate the radius of the curve R (1 / curvature K).
-K is evaluated as the difference in x-coord divided by difference in yaw between successive Ego path sections.
+In the end, I chose a formula in the lecture Path Feasibility slide to evaluate the radius of the curve R (1 / curvature K).
+K is evaluated as the difference in x-coord divided by the difference in yaw between successive Ego path sections.
 
-``` R = 1/K = dx/dphi ```
+``` R = 1/K = d_x/d_phi ```
 
 For each potential Ego state, I used spline library to give me a path.  Then, I applied my curvature calculations to obtain the
 centripetal acceleration at each section along the curve.
+
  ``` AccN = square(Vel_section)/R ```
+
  The overall path was assigned the maximum centripetal acceleration.  My centripetal acceleration estimates were below what the simulator reported.
  Nevertheless, the estimates had a good correlation with the simulator allowing me to get rid of the risky/uncomfortable lane changing trajectories.
  As a result, Ego might be seen hesitating to change lane in some cases when it thinks the curve is too steep.   In case of KL state,
@@ -81,5 +83,5 @@ centripetal acceleration at each section along the curve.
 
 ## Suggestions
 
-- Simulator has a reported bug where Frenet s-coors are reported as 0 about 30 m. before reaching end of the track.  This needs to be fixed.
-- It would be of great benefit if we could replay simulator runs with the a different Ego planner code version.  This would allow the students to test the code changes to see how the run has improved.  Currently, we are writing the code against what feels like a random situation generator without an ability to reproduce it.
+- Simulator has a reported bug where Frenet s-coors are reported as 0 about 30 m. before reaching the end of the track.  This needs to be fixed.
+- It would be of great benefit if we could replay simulator runs with different Ego planner code versions.  This would allow the students to test the code changes to see how the run has improved.  Currently, we are writing the code against what feels like a random situation generator without an ability to reproduce it.
