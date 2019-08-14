@@ -132,7 +132,7 @@ vector<Car::Position> Ego::get_best_path() {
     this->recordIncident();
 
     vector<FSM_STATES > possible_successor_states = get_possible_successor_states();
-    double min_traj_cost = INT_MAX;
+    double min_traj_cost = std::numeric_limits<int>::max();
     Ego::Trajectory bestTraj;
     vector<Car::Position> bestPath;
 
@@ -307,7 +307,7 @@ vector<Ego::Trajectory> Ego::generate_trajectory(FSM_STATES next_state) {
 vector<Ego::Trajectory> Ego::gen_keep_lane_trajectory() {
     double new_v = get_kinematics(this->lane);
     double sp1 = Car::SPLINE_POINT_1;
-    double min_acc_tot = MAXFLOAT;
+    double min_acc_tot = std::numeric_limits<double>::max();
     Trajectory best_traj;
     for (int i = 0; sp1 + i < Car::SPLINE_POINT_2; i += 4) {
         Trajectory traj = Trajectory(FSM_STATES::KL, this->lane, sp1 + i,
@@ -364,7 +364,7 @@ vector<Ego::Trajectory> Ego::gen_lane_change_trajectories(Ego::FSM_STATES state)
     }
 
     Trajectory bestTraj;
-    double min_acc = MAXFLOAT;
+    double min_acc = std::numeric_limits<double>::max();
     for (int i = 0; sp1 + i < Car::SPLINE_POINT_2; i += 4) {
         Trajectory traj = Trajectory(state, target_change_lane, sp1+i, target_d, change_lane_speed);
         traj.path = getPath(this->previous_path_x, this->previous_path_y, traj.target_spline1_s, traj.target_d, traj.target_v, (double)Car::PREDICTION_FAR_HORIZON_SEC);
