@@ -19,7 +19,7 @@ project implementation.  For the proper intro and the info on how to run the pro
 As a basis for the path planner, I adopted the ideas from the Udacity lecture: Finite State Machine (FSM) and Cost Functions.
 Here's the diagram describing the planner.
 
-![Path Planning FSM and Cost Functions](./readme_files/Path Planner FSM and Cost Diagram.jpg)
+![Path Planning FSM and Cost Functions](./readme_files/Path_Planner_FSM_and_Cost_Diagram.jpg)
 
 There are 5 possible states in the FSM: Keep Lane (KL), Prepare Lane Change Left (PLCL), Prepare Lane Change Right (PLCR),
 Lane Change Left (LCL), Lane Change Right (LCR).  Each state has a unique *modus operandi*.
